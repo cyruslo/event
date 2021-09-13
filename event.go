@@ -1,63 +1,97 @@
 package event
 
 import (
+	"github.com/go-kratos/kratos/pkg/log"
+	"runtime/debug"
 	"sync"
 )
 
-type HandleFunc struct {
-	method func(...interface{}) interface{}
-	owner  int64
+type IEventHandler interface {
+	NewListener(EventType, int64, func(IEvent)) *listener
+	Subscribe(*listener) bool
+	UnSubscribe(EventType, int64)
+	Execute(IEvent) bool
 }
 
-var eventMap sync.Map
+type IEvent interface {
+	GetEventType() EventType
+}
 
-func NewHandleFunc(owner int64, method func(...interface{}) interface{}) *HandleFunc {
-	return &HandleFunc{
-		method: method,
-		owner:  owner,
+type eventHandler struct {
+}
+
+type listener struct {
+	eventType EventType
+	owner     int64 //监听者唯一id
+	method    func(event IEvent)
+}
+
+type eventQueueElem struct {
+	event IEvent
+	*listener
+}
+
+var (
+	listenerMap sync.Map
+	eventQueue  chan *eventQueueElem
+)
+
+func NewListener(eventType EventType, owner int64, method func(event IEvent)) *listener {
+	if owner < 0 {
+		return nil
+	}
+	return &listener{
+		eventType: eventType,
+		owner:     owner,
+		method:    method,
 	}
 }
 
-func Subscribe(event int, handle *HandleFunc) bool {
-	if handle == nil {
+//Subscribe a listener
+func Subscribe(listener *listener) bool {
+	if listener == nil {
 		return false
 	}
-	if value, loaded := eventMap.Load(event); loaded {
+	if value, loaded := listenerMap.Load(listener.eventType); loaded {
 		if handles, ok := value.(*sync.Map); ok {
-			if _, ok := (*handles).Load(handle.owner); ok {
+			if _, load := handles.LoadOrStore(listener.owner, listener); load {
 				return true
 			} else {
-				(*handles).Store(handle.owner, handle)
-				eventMap.Store(event, handles)
+				listenerMap.Store(listener.eventType, handles)
 			}
 		} else {
 			return false
 		}
 	} else {
 		var handles = new(sync.Map)
-		(*handles).Store(handle.owner, handle)
-		eventMap.Store(event, handles)
+		handles.Store(listener.owner, listener)
+		listenerMap.Store(listener.eventType, handles)
 	}
 	return true
 }
 
-func UnSubscribe(event int, handle *HandleFunc) {
-	if value, loaded := eventMap.Load(event); !loaded {
+// owner = -1:delete all of eventType
+func UnSubscribe(eventType EventType, owner int64) {
+	if value, loaded := listenerMap.Load(eventType); !loaded {
 		return
 	} else {
+		if owner == -1 {
+			listenerMap.Delete(eventType)
+			return
+		}
 		if handles, ok := value.(*sync.Map); ok {
-			if _, ok := (*handles).Load(handle.owner); ok {
-				(*handles).Delete(handle.owner)
+			if _, ok := handles.Load(owner); ok {
+				handles.Delete(owner)
 			}
 			var count = 0
-			(*handles).Range(func(k, v interface{}) bool {
+			handles.Range(func(k, v interface{}) bool {
 				count++
 				return true
 			})
 			if count <= 0 {
-				eventMap.Delete(event)
+				listenerMap.Delete(eventType)
 			} else {
-				eventMap.Store(event, handles)
+				listenerMap.Store(eventType, handles)
 			}
 		} else {
 			panic("unsubscribe event, loaded type err")
@@ -65,14 +99,18 @@ func UnSubscribe(event int, handle *HandleFunc) {
 	}
 }
 
-func Execute(event int, args ...interface{}) bool {
-	if value, loaded := eventMap.Load(event); !loaded {
+func Execute(event IEvent) bool {
+	eventType := event.GetEventType()
+	if value, loaded := listenerMap.Load(eventType); !loaded {
 		return false
 	} else {
 		if handles, ok := value.(*sync.Map); ok {
 			(*handles).Range(func(k, v interface{}) bool {
-				if handle, r := v.(*HandleFunc); r {
-					handle.method(args...)
+				if listener, ok := v.(*listener); ok {
+					eventQueue <- &eventQueueElem{
+						event:    event,
+						listener: listener,
+					}
 					return true
 				} else {
 					return false
@@ -84,3 +122,30 @@ func Execute(event int, args ...interface{}) bool {
 	}
 	return true
 }
+
+func (self *eventHandler) run() {
+	log.Info("event handler start")
+	go func() {
+		defer func() {
+			if err := recover(); err != nil {
+				log.Error("Event handler Recover:%s", err)
+				log.Error("Stack:%s", debug.Stack())
+				self.run()
+			}
+		}()
+		for {
+			ele := <-eventQueue
+			ele.method(ele.event)
+		}
+	}()
+}
+
+func init() {
+	listenerMap = sync.Map{}
+	eventQueue = make(chan *eventQueueElem, EVENT_CHANNEL_LEN)
+	for i := 0; i < EXECUTOR_NUM; i++ {
+		handler := &eventHandler{}
+		handler.run()
+	}
+}
+
