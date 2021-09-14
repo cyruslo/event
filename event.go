@@ -6,13 +6,6 @@ import (
 	"sync"
 )
 
-type IEventHandler interface {
-	NewListener(EventType, int64, func(IEvent)) *listener
-	Subscribe(*listener) bool
-	UnSubscribe(EventType, int64)
-	Execute(IEvent) bool
-}
-
 type IEvent interface {
 	GetEventType() EventType
 }
